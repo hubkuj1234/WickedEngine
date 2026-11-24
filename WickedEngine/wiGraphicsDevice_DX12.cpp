@@ -2168,8 +2168,12 @@ std::mutex queue_locker;
 		auto internal_state = to_internal(pso);
 
 		ID3D12PipelineState* pipeline = nullptr;
+		std::unique_lock<std::mutex> pso_lck(pipelines_global_locker);
 		auto it = pipelines_global.find(pipeline_hash);
-		if (it == pipelines_global.end())
+		const bool found_in_global = (it != pipelines_global.end());
+		PipelineState global_copy = found_in_global ? it->second : PipelineState{};
+		pso_lck.unlock();
+		if (!found_in_global)
 		{
 			for (auto& x : commandlist.pipelines_worker)
 			{
@@ -5451,14 +5455,18 @@ std::mutex queue_locker;
 					commandlist.signals.clear();
 				}
 
-				for (auto& x : commandlist.pipelines_worker)
+				if (!commandlist.pipelines_worker.empty())
 				{
-					if (pipelines_global.count(x.first) == 0)
+					std::scoped_lock pso_lck(pipelines_global_locker);
+					for (auto& x : commandlist.pipelines_worker)
 					{
-						pipelines_global[x.first] = x.second;
+						if (pipelines_global.count(x.first) == 0)
+						{
+							pipelines_global[x.first] = x.second;
+						}
 					}
+					commandlist.pipelines_worker.clear();
 				}
-				commandlist.pipelines_worker.clear();
 			}
 
 			// Mark the completion of queues for this frame:
@@ -5533,6 +5541,16 @@ std::mutex queue_locker;
 
 		descriptorheap_res.SignalGPU(queues[QUEUE_GRAPHICS].queue.Get());
 		descriptorheap_sam.SignalGPU(queues[QUEUE_GRAPHICS].queue.Get());
+
+		if (timeline_3d_fence == nullptr)
+		{
+			dx12_check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, PPV_ARGS(timeline_3d_fence)));
+		}
+		if (queues[QUEUE_GRAPHICS].queue != nullptr)
+		{
+			timeline_3d_value++;
+			dx12_check(queues[QUEUE_GRAPHICS].queue->Signal(timeline_3d_fence.Get(), timeline_3d_value));
+		}
 
 		// From here, we begin a new frame, this affects GetBufferIndex()!
 		FRAMECOUNT++;
@@ -5839,7 +5857,10 @@ std::mutex queue_locker;
 	void GraphicsDevice_DX12::ClearPipelineStateCache()
 	{
 		multidraw_signatures.clear();
-		pipelines_global.clear();
+		{
+			std::scoped_lock pso_lck(pipelines_global_locker);
+			pipelines_global.clear();
+		}
 
 		for (auto& x : commandlists)
 		{
@@ -7852,6 +7873,120 @@ std::mutex queue_locker;
 			PIXSetMarker(commandlist.GetGraphicsCommandList(), 0xFFFF0000, text);
 		}
 	}
+	CommandList GraphicsDevice_DX12::BeginPresentCommandList()
+	{
+		if (present_queue == nullptr)
+		{
+			D3D12_COMMAND_QUEUE_DESC qdesc = {};
+			qdesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+			dx12_check(device->CreateCommandQueue(&qdesc, PPV_ARGS(present_queue)));
+			dx12_check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, PPV_ARGS(present_fence)));
+		}
+		const uint32_t slot = present_slot_cursor % kPresentSlotCount;
+		present_slot_cursor++;
+		if (present_slot_fences[slot] > 0 && present_fence->GetCompletedValue() < present_slot_fences[slot])
+		{
+			dx12_check(present_fence->SetEventOnCompletion(present_slot_fences[slot], nullptr));
+		}
+		CommandList_DX12& commandlist = present_cmd_slots[slot];
+		commandlist.queue = QUEUE_GRAPHICS;
+		commandlist.id = 0x80000000u | slot;
+		if (commandlist.commandLists[QUEUE_GRAPHICS] == nullptr)
+		{
+			dx12_check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, PPV_ARGS(commandlist.commandAllocators[0][QUEUE_GRAPHICS])));
+			dx12_check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandlist.commandAllocators[0][QUEUE_GRAPHICS].Get(), nullptr, PPV_ARGS(commandlist.commandLists[QUEUE_GRAPHICS])));
+			dx12_check(static_cast<ID3D12GraphicsCommandList*>(commandlist.commandLists[QUEUE_GRAPHICS].Get())->Close());
+			commandlist.binder.init(this);
+		}
+		commandlist.reset(0);
+		dx12_check(commandlist.GetCommandAllocator()->Reset());
+		dx12_check(commandlist.GetGraphicsCommandList()->Reset(commandlist.GetCommandAllocator(), nullptr));
+		ID3D12DescriptorHeap* heaps[] = { descriptorheap_res.heap_GPU.Get(), descriptorheap_sam.heap_GPU.Get() };
+		commandlist.GetGraphicsCommandList()->SetDescriptorHeaps(arraysize(heaps), heaps);
+		CommandList cmd;
+		cmd.internal_state = &commandlist;
+		return cmd;
+	}
+
+	PresentLaneFence GraphicsDevice_DX12::SubmitPresentCommandList(CommandList cmd, const SwapChain* swapchain)
+	{
+		CommandList_DX12& commandlist = GetCommandList(cmd);
+		const uint32_t slot = commandlist.id & 0xFFu;
+		dx12_check(commandlist.GetGraphicsCommandList()->Close());
+		if (!commandlist.pipelines_worker.empty())
+		{
+			std::scoped_lock pso_lck(pipelines_global_locker);
+			for (auto& x : commandlist.pipelines_worker)
+			{
+				if (pipelines_global.count(x.first) == 0)
+				{
+					pipelines_global[x.first] = x.second;
+				}
+			}
+			commandlist.pipelines_worker.clear();
+		}
+		ID3D12CommandList* cbs[] = { commandlist.GetGraphicsCommandList() };
+		ID3D12CommandQueue* submit_q = queues[QUEUE_GRAPHICS].queue.Get();
+		submit_q->ExecuteCommandLists(1, cbs);
+		if (swapchain != nullptr && swapchain->IsValid())
+		{
+			auto internal_state = to_internal(swapchain);
+			UINT presentFlags = 0;
+			if (!swapchain->desc.vsync && !swapchain->desc.fullscreen && tearingSupported)
+			{
+				presentFlags |= DXGI_PRESENT_ALLOW_TEARING;
+			}
+			dx12_check(internal_state->swapChain->Present(swapchain->desc.vsync ? 1 : 0, presentFlags));
+		}
+		present_fence_value++;
+		dx12_check(submit_q->Signal(present_fence.Get(), present_fence_value));
+		if (slot < kPresentSlotCount)
+		{
+			present_slot_fences[slot] = present_fence_value;
+		}
+		return PresentLaneFence{ present_fence_value };
+	}
+
+	bool GraphicsDevice_DX12::IsPresentFenceComplete(PresentLaneFence fence) const
+	{
+		if (fence.value == 0 || present_fence == nullptr) return true;
+		return present_fence->GetCompletedValue() >= fence.value;
+	}
+
+	void GraphicsDevice_DX12::WaitPresentFence(PresentLaneFence fence, uint64_t timeout_ms) const
+	{
+		(void)timeout_ms;
+		if (fence.value == 0 || present_fence == nullptr) return;
+		if (present_fence->GetCompletedValue() < fence.value)
+		{
+			dx12_check(present_fence->SetEventOnCompletion(fence.value, nullptr));
+		}
+	}
+
+	bool GraphicsDevice_DX12::WaitForPresentOpportunity(SwapChain* swapchain, double timeout_seconds, PresentTimingInfo* out_timing)
+	{
+		(void)swapchain;
+		(void)timeout_seconds;
+		if (out_timing) *out_timing = {};
+		return true;
+	}
+
+	uint64_t GraphicsDevice_DX12::GetLastSubmitted3DFrameFenceValue() const
+	{
+		return timeline_3d_value;
+	}
+
+	bool GraphicsDevice_DX12::Is3DFrameFenceComplete(uint64_t fence_value) const
+	{
+		if (fence_value == 0 || timeline_3d_fence == nullptr) return true;
+		return timeline_3d_fence->GetCompletedValue() >= fence_value;
+	}
+
+	void* GraphicsDevice_DX12::GetNativeDeviceHandle() const { return device.Get(); }
+	void* GraphicsDevice_DX12::GetNativeCommandBufferHandle(CommandList cmd) const { return GetCommandList(cmd).GetGraphicsCommandList(); }
+	void* GraphicsDevice_DX12::GetNativeTextureHandle(const Texture* texture) const { return const_cast<GraphicsDevice_DX12*>(this)->GetTextureInternalResource(texture); }
+	void GraphicsDevice_DX12::FlushCommandListForNativeHook(CommandList cmd) { (void)cmd; }
+
 	ID3D12Resource* GraphicsDevice_DX12::GetTextureInternalResource(const Texture* texture)
 	{
 		return to_internal(texture)->resource.Get();

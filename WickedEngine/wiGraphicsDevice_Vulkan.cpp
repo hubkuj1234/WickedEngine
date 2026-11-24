@@ -1297,7 +1297,20 @@ namespace vulkan_internal
 		createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 		createInfo.preTransform = swapchain_capabilities.currentTransform;
 
-		createInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR; // The only one that is always supported
+		createInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR; // Tear-free VRR / VSync baseline
+#ifdef VK_PRESENT_MODE_FIFO_LATEST_READY_EXT
+		if (internal_state->desc.vsync)
+		{
+			for (auto& presentMode : swapchain_presentModes)
+			{
+				if (presentMode == VK_PRESENT_MODE_FIFO_LATEST_READY_EXT)
+				{
+					createInfo.presentMode = VK_PRESENT_MODE_FIFO_LATEST_READY_EXT;
+					break;
+				}
+			}
+		}
+#endif
 		if (!internal_state->desc.vsync)
 		{
 			// The mailbox/immediate present mode is not necessarily supported:
@@ -1801,7 +1814,7 @@ using namespace vulkan_internal;
 		if (descriptorSet == VK_NULL_HANDLE || (dirty & DIRTY_DESCRIPTOR))
 		{
 			const PSOLayout& layout = commandlist.layout;
-			auto& binder_pool = commandlist.binder_pools[device->GetBufferIndex()];
+			auto& binder_pool = commandlist.binder_pools[commandlist.buffer_index];
 			descriptorSet = binder_pool.allocate(layout);
 
 			struct DescriptorTableInfo
@@ -2120,8 +2133,12 @@ using namespace vulkan_internal;
 		auto internal_state = to_internal(pso);
 
 		VkPipeline pipeline = VK_NULL_HANDLE;
+		std::unique_lock<std::mutex> pso_lck(pipelines_global_locker);
 		auto it = pipelines_global.find(pipeline_hash);
-		if (it == pipelines_global.end())
+		const bool found_in_global = (it != pipelines_global.end());
+		PipelineState global_copy = found_in_global ? it->second : PipelineState{};
+		pso_lck.unlock();
+		if (!found_in_global)
 		{
 			for (auto& x : commandlist.pipelines_worker)
 			{
@@ -3647,6 +3664,13 @@ using namespace vulkan_internal;
 		swapchain->desc = *desc;
 
 		// Surface creation:
+		if(internal_state->surface == VK_NULL_HANDLE && GetVulkanSurfaceCreator() != nullptr)
+		{
+			if (!GetVulkanSurfaceCreator()((void*)instance, (void*)window, &internal_state->surface))
+			{
+				return false;
+			}
+		}
 		if(internal_state->surface == VK_NULL_HANDLE)
 		{
 #ifdef _WIN32
@@ -6829,14 +6853,18 @@ using namespace vulkan_internal;
 					queue.submit(this, VK_NULL_HANDLE);
 				}
 
-				for (auto& x : commandlist.pipelines_worker)
+				if (!commandlist.pipelines_worker.empty())
 				{
-					if (pipelines_global.count(x.first) == 0)
+					std::scoped_lock pso_lck(pipelines_global_locker);
+					for (auto& x : commandlist.pipelines_worker)
 					{
-						pipelines_global[x.first] = x.second;
+						if (pipelines_global.count(x.first) == 0)
+						{
+							pipelines_global[x.first] = x.second;
+						}
 					}
+					commandlist.pipelines_worker.clear();
 				}
-				commandlist.pipelines_worker.clear();
 			}
 
 			// final submits with fences:
@@ -6863,6 +6891,8 @@ using namespace vulkan_internal;
 				queues[queue1].wait(semaphore);
 			}
 		}
+
+		frame_submitted_value[GetBufferIndex()] = timeline_3d_submitted.fetch_add(1, std::memory_order_acq_rel) + 1;
 
 		// From here, we begin a new frame, this affects GetBufferIndex()!
 		FRAMECOUNT++;
@@ -6946,7 +6976,10 @@ using namespace vulkan_internal;
 		pso_layouts.clear();
 		layout_locker.unlock();
 
-		pipelines_global.clear();
+		{
+			std::scoped_lock pso_lck(pipelines_global_locker);
+			pipelines_global.clear();
+		}
 
 		for (auto& x : commandlists)
 		{
@@ -9105,6 +9138,192 @@ using namespace vulkan_internal;
 	{
 		return device;
 	}
+	CommandList GraphicsDevice_Vulkan::BeginPresentCommandList()
+	{
+		const uint32_t slot = present_slot_cursor % kPresentSlotCount;
+		present_slot_cursor++;
+		if (present_slot_fences[slot] == VK_NULL_HANDLE)
+		{
+			VkFenceCreateInfo fi = {};
+			fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+			fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+			vulkan_check(vkCreateFence(device, &fi, nullptr, &present_slot_fences[slot]));
+		}
+		vulkan_check(vkWaitForFences(device, 1, &present_slot_fences[slot], VK_TRUE, 2000000000ull));
+		vulkan_check(vkResetFences(device, 1, &present_slot_fences[slot]));
+
+		CommandList_Vulkan& commandlist = present_cmd_slots[slot];
+		commandlist.queue = QUEUE_GRAPHICS;
+		commandlist.id = 0x80000000u | slot;
+		if (commandlist.commandBuffers[0][QUEUE_GRAPHICS] == VK_NULL_HANDLE)
+		{
+			VkCommandPoolCreateInfo poolInfo = {};
+			poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+			poolInfo.queueFamilyIndex = graphicsFamily;
+			vulkan_check(vkCreateCommandPool(device, &poolInfo, nullptr, &commandlist.commandPools[0][QUEUE_GRAPHICS]));
+			VkCommandBufferAllocateInfo cbInfo = {};
+			cbInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+			cbInfo.commandPool = commandlist.commandPools[0][QUEUE_GRAPHICS];
+			cbInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+			cbInfo.commandBufferCount = 1;
+			vulkan_check(vkAllocateCommandBuffers(device, &cbInfo, &commandlist.commandBuffers[0][QUEUE_GRAPHICS]));
+			commandlist.binder.init(this);
+			commandlist.binder_pools[0].init(this);
+		}
+		commandlist.reset(0);
+		vulkan_check(vkResetCommandPool(device, commandlist.GetCommandPool(), 0));
+		VkCommandBufferBeginInfo beginInfo = {};
+		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		vulkan_check(vkBeginCommandBuffer(commandlist.GetCommandBuffer(), &beginInfo));
+		CommandList cmd;
+		cmd.internal_state = &commandlist;
+		return cmd;
+	}
+
+	PresentLaneFence GraphicsDevice_Vulkan::SubmitPresentCommandList(CommandList cmd, const SwapChain* swapchain)
+	{
+		(void)swapchain;
+		CommandList_Vulkan& commandlist = GetCommandList(cmd);
+		const uint32_t slot = commandlist.id & 0xFFu;
+		vulkan_check(vkEndCommandBuffer(commandlist.GetCommandBuffer()));
+		if (!commandlist.pipelines_worker.empty())
+		{
+			std::scoped_lock pso_lck(pipelines_global_locker);
+			for (auto& x : commandlist.pipelines_worker)
+			{
+				if (pipelines_global.count(x.first) == 0)
+				{
+					pipelines_global[x.first] = x.second;
+				}
+			}
+			commandlist.pipelines_worker.clear();
+		}
+		CommandQueue& q = queues[QUEUE_GRAPHICS];
+		std::scoped_lock lock(*q.locker);
+		VkCommandBufferSubmitInfo cbInfo = {};
+		cbInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+		cbInfo.commandBuffer = commandlist.GetCommandBuffer();
+		wi::vector<VkSemaphoreSubmitInfo> waits;
+		wi::vector<VkSemaphoreSubmitInfo> signals;
+		wi::vector<VkSwapchainKHR> scs;
+		wi::vector<uint32_t> imgIndices;
+		wi::vector<VkSemaphore> presentWaits;
+		for (auto& sc : commandlist.prev_swapchains)
+		{
+			auto internal_state = to_internal(&sc);
+			VkSemaphoreSubmitInfo w = {};
+			w.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+			w.semaphore = internal_state->swapchainAcquireSemaphores[internal_state->swapChainAcquireSemaphoreIndex];
+			w.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+			waits.push_back(w);
+			VkSemaphoreSubmitInfo s = {};
+			s.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+			s.semaphore = internal_state->swapchainReleaseSemaphores[internal_state->swapChainImageIndex];
+			s.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+			signals.push_back(s);
+			scs.push_back(internal_state->swapChain);
+			imgIndices.push_back(internal_state->swapChainImageIndex);
+			presentWaits.push_back(s.semaphore);
+		}
+		VkSubmitInfo2 submitInfo = {};
+		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+		submitInfo.commandBufferInfoCount = 1;
+		submitInfo.pCommandBufferInfos = &cbInfo;
+		submitInfo.waitSemaphoreInfoCount = (uint32_t)waits.size();
+		submitInfo.pWaitSemaphoreInfos = waits.data();
+		submitInfo.signalSemaphoreInfoCount = (uint32_t)signals.size();
+		submitInfo.pSignalSemaphoreInfos = signals.data();
+		vulkan_check(vkQueueSubmit2(q.queue, 1, &submitInfo, present_slot_fences[slot]));
+		if (!scs.empty())
+		{
+			VkPresentInfoKHR presentInfo = {};
+			presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+			presentInfo.waitSemaphoreCount = (uint32_t)presentWaits.size();
+			presentInfo.pWaitSemaphores = presentWaits.data();
+			presentInfo.swapchainCount = (uint32_t)scs.size();
+			presentInfo.pSwapchains = scs.data();
+			presentInfo.pImageIndices = imgIndices.data();
+			VkResult res = vkQueuePresentKHR(q.queue, &presentInfo);
+			if (res == VK_SUBOPTIMAL_KHR || res == VK_ERROR_OUT_OF_DATE_KHR)
+			{
+				for (auto& sc : commandlist.prev_swapchains)
+				{
+					auto internal_state = to_internal(&sc);
+					CreateSwapChainInternal(internal_state, physicalDevice, device, allocationhandler);
+				}
+			}
+		}
+		commandlist.prev_swapchains.clear();
+		present_fence_counter++;
+		present_slot_fence_values[slot] = present_fence_counter;
+		return PresentLaneFence{ present_fence_counter };
+	}
+
+	bool GraphicsDevice_Vulkan::IsPresentFenceComplete(PresentLaneFence fence) const
+	{
+		if (fence.value == 0) return true;
+		for (uint32_t i = 0; i < kPresentSlotCount; ++i)
+		{
+			if (present_slot_fence_values[i] == fence.value && present_slot_fences[i] != VK_NULL_HANDLE)
+			{
+				return vkGetFenceStatus(device, present_slot_fences[i]) == VK_SUCCESS;
+			}
+		}
+		return true;
+	}
+
+	void GraphicsDevice_Vulkan::WaitPresentFence(PresentLaneFence fence, uint64_t timeout_ms) const
+	{
+		if (fence.value == 0) return;
+		for (uint32_t i = 0; i < kPresentSlotCount; ++i)
+		{
+			if (present_slot_fence_values[i] == fence.value && present_slot_fences[i] != VK_NULL_HANDLE)
+			{
+				vkWaitForFences(device, 1, &present_slot_fences[i], VK_TRUE, timeout_ms * 1000000ull);
+				return;
+			}
+		}
+	}
+
+	bool GraphicsDevice_Vulkan::WaitForPresentOpportunity(SwapChain* swapchain, double timeout_seconds, PresentTimingInfo* out_timing)
+	{
+		(void)swapchain;
+		(void)timeout_seconds;
+		if (out_timing) *out_timing = {};
+		return true;
+	}
+
+	uint64_t GraphicsDevice_Vulkan::GetLastSubmitted3DFrameFenceValue() const
+	{
+		return timeline_3d_submitted.load(std::memory_order_acquire);
+	}
+
+	bool GraphicsDevice_Vulkan::Is3DFrameFenceComplete(uint64_t fence_value) const
+	{
+		if (fence_value == 0) return true;
+		for (uint32_t b = 0; b < BUFFERCOUNT; ++b)
+		{
+			if (frame_submitted_value[b] == fence_value)
+			{
+				for (int q = 0; q < QUEUE_COUNT; ++q)
+				{
+					if (frame_fence[b][q] != VK_NULL_HANDLE && vkGetFenceStatus(device, frame_fence[b][q]) != VK_SUCCESS)
+					{
+						return false;
+					}
+				}
+				return true;
+			}
+		}
+		return true;
+	}
+
+	void* GraphicsDevice_Vulkan::GetNativeDeviceHandle() const { return (void*)device; }
+	void* GraphicsDevice_Vulkan::GetNativeCommandBufferHandle(CommandList cmd) const { return (void*)GetCommandList(cmd).GetCommandBuffer(); }
+	void* GraphicsDevice_Vulkan::GetNativeTextureHandle(const Texture* texture) const { return (void*)(uintptr_t)const_cast<GraphicsDevice_Vulkan*>(this)->GetTextureInternalResource(texture); }
+	void GraphicsDevice_Vulkan::FlushCommandListForNativeHook(CommandList cmd) { (void)cmd; }
+
 	VkImage GraphicsDevice_Vulkan::GetTextureInternalResource(const Texture* texture)
 	{
 		return to_internal(texture)->resource;

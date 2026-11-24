@@ -2,6 +2,7 @@
 #ifdef __APPLE__
 #include "CommonInclude.h"
 #include "wiPlatform.h"
+#include "wiAppleHelper.h"
 #include "wiAllocator.h"
 #include "wiGraphicsDevice.h"
 #include "wiUnorderedMap.h"
@@ -16,7 +17,7 @@
 #include <deque>
 
 // There are crashes with this in graphics debugger, so this can be disabled:
-#define USE_TEXTURE_VIEW_POOL
+// DAISY_DISABLE_TEXTURE_VIEW_POOL: stable retained texture views
 
 namespace wi::graphics
 {
@@ -72,30 +73,48 @@ namespace wi::graphics
 		{
 			NS::SharedPtr<MTL4::CommandQueue> queue;
 			wi::vector<MTL4::CommandBuffer*> submit_cmds;
+			mutable std::mutex queue_locker;
 			
 			void signal(const Semaphore& sema)
 			{
 				if (queue.get() == nullptr)
 					return;
+				std::scoped_lock q_lck(queue_locker);
 				queue->signalEvent(sema.event.get(), sema.fenceValue);
 			}
 			void wait(const Semaphore& sema)
 			{
 				if (queue.get() == nullptr)
 					return;
+				std::scoped_lock q_lck(queue_locker);
 				queue->wait(sema.event.get(), sema.fenceValue);
 			}
-			void submit()
+			template<typename AllocHandler>
+			void submit(AllocHandler* ah)
 			{
 				if (queue.get() == nullptr)
 					return;
 				if (submit_cmds.empty())
 					return;
-				queue->commit(submit_cmds.data(), submit_cmds.size());
+				std::scoped_lock q_lck(queue_locker);
+				if (ah != nullptr)
+				{
+					std::scoped_lock lck(ah->destroylocker);
+					ah->commit_residency_locked();
+					wi::apple::CommitMetal4CommandBuffers(queue.get(), reinterpret_cast<void* const*>(submit_cmds.data()), submit_cmds.size(), "3D");
+				}
+				else
+				{
+					wi::apple::CommitMetal4CommandBuffers(queue.get(), reinterpret_cast<void* const*>(submit_cmds.data()), submit_cmds.size(), "3D");
+				}
 				submit_cmds.clear();
 			}
 		} queues[QUEUE_COUNT];
 		
+		public:
+		MTL::SharedEvent* get_frame_fence(uint32_t bufferindex, QUEUE_TYPE queue = QUEUE_COMPUTE) const { (void)queue; return frame_fence[bufferindex][QUEUE_GRAPHICS].get(); }
+		uint64_t get_frame_fence_value(uint32_t bufferindex) const { return frame_fence_values[bufferindex]; }
+	private:
 		uint64_t frame_fence_values[BUFFERCOUNT] = {};
 		NS::SharedPtr<MTL::SharedEvent> frame_fence[BUFFERCOUNT][QUEUE_COUNT];
 		
@@ -106,6 +125,7 @@ namespace wi::graphics
 			GraphicsDevice_Metal* device = nullptr;
 			NS::SharedPtr<MTL4::CommandQueue> uploadqueue;
 			std::mutex locker;
+			mutable std::mutex upload_queue_locker;
 			
 			struct CopyCMD
 			{
@@ -160,6 +180,7 @@ namespace wi::graphics
 						cmd.uploadbuffer = NS::TransferPtr(device->device->newBuffer(staging_size, MTL::ResourceStorageModeShared | MTL::ResourceOptionCPUCacheModeWriteCombined));
 						device->allocationhandler->destroylocker.lock();
 						device->allocationhandler->residency_set->addAllocation(cmd.uploadbuffer.get());
+						device->allocationhandler->residency_dirty = true;
 						device->allocationhandler->destroylocker.unlock();
 						cmd.mapped_data = (uint8_t*)cmd.uploadbuffer->contents();
 					}
@@ -178,16 +199,23 @@ namespace wi::graphics
 				
 				cmd.fenceValue++;
 				
-				device->allocationhandler->destroylocker.lock();
-				device->allocationhandler->residency_set->commit();
-				device->allocationhandler->destroylocker.unlock();
-				
-				uploadqueue->commit(cmds, arraysize(cmds));
-				uploadqueue->signalEvent(cmd.event.get(), cmd.fenceValue);
+				{
+					std::scoped_lock q_lck(upload_queue_locker);
+					{
+						std::scoped_lock lck(device->allocationhandler->destroylocker);
+						device->allocationhandler->commit_residency_locked();
+						wi::apple::CommitMetal4CommandBuffers(uploadqueue.get(), reinterpret_cast<void* const*>(cmds), arraysize(cmds), "Upload");
+					}
+					uploadqueue->signalEvent(cmd.event.get(), cmd.fenceValue);
+				}
 				
 				if (wait_cpu)
 				{
-					cmd.event->waitUntilSignaledValue(cmd.fenceValue, ~0ull);
+					if (!cmd.event->waitUntilSignaledValue(cmd.fenceValue, 5000))
+					{
+						std::fprintf(stderr, "[Metal4 Upload] fence timeout waiting for value %llu (signaled=%llu)\n", (unsigned long long)cmd.fenceValue, (unsigned long long)cmd.event->signaledValue());
+						std::fflush(stderr);
+					}
 					
 					std::scoped_lock lck(locker);
 					freelist.push_back(std::move(cmd));
@@ -198,6 +226,7 @@ namespace wi::graphics
 					{
 						if (device->queues[queue].queue.get() == nullptr)
 							continue;
+						std::scoped_lock q_lck(device->queues[queue].queue_locker);
 						device->queues[queue].queue->wait(cmd.event.get(), cmd.fenceValue);
 					}
 					
@@ -243,6 +272,7 @@ namespace wi::graphics
 			GPULinearAllocator frame_allocators[BUFFERCOUNT];
 			RenderPassInfo renderpass_info;
 			uint32_t id = 0;
+			uint32_t buffer_index = 0;
 			QUEUE_TYPE queue = QUEUE_COUNT;
 			const PipelineState* active_pso = nullptr;
 			bool dirty_pso = false;
@@ -306,6 +336,7 @@ namespace wi::graphics
 
 			void reset(uint32_t bufferindex)
 			{
+				buffer_index = bufferindex;
 				frame_allocators[bufferindex].reset();
 				renderpass_info = {};
 				id = 0;
@@ -361,7 +392,24 @@ namespace wi::graphics
 		uint32_t cmd_count = 0;
 		wi::SpinLock cmd_locker;
 		
+		mutable std::mutex pipelines_global_locker;
 		wi::unordered_map<PipelineHash, JustInTimePSO> pipelines_global;
+
+		// Independent Present/UI submission lane (never contends with 3D SubmitCommandLists):
+		static constexpr uint32_t kPresentSlotCount = 3;
+		CommandQueue present_queue;
+		CommandList_Metal present_cmd_slots[kPresentSlotCount];
+		bool present_cmd_initialized[kPresentSlotCount] = {};
+		NS::SharedPtr<MTL::SharedEvent> present_fence;
+		uint64_t present_fence_value = 0;
+		uint64_t present_slot_fences[kPresentSlotCount] = {};
+		uint32_t present_slot_cursor = 0;
+
+		// Monotonic 3D completion timeline (signaled on GRAPHICS after cross-queue sync):
+		NS::SharedPtr<MTL::SharedEvent> timeline_3d_event;
+		uint64_t timeline_3d_value = 0;
+		mutable NS::SharedPtr<MTL4::Compiler> mtl4_compiler;
+		std::deque<std::pair<Semaphore, uint64_t>> deferred_semaphores;
 		
 		NS::SharedPtr<MTL::Buffer> descriptor_heap_res;
 		NS::SharedPtr<MTL::Buffer> descriptor_heap_sam;
@@ -419,6 +467,20 @@ namespace wi::graphics
 
 		CommandList BeginCommandList(QUEUE_TYPE queue = QUEUE_GRAPHICS) override;
 		void SubmitCommandLists() override;
+		CommandList BeginPresentCommandList() override;
+		PresentLaneFence SubmitPresentCommandList(CommandList cmd, const SwapChain* swapchain = nullptr) override;
+		bool IsPresentFenceComplete(PresentLaneFence fence) const override;
+		void WaitPresentFence(PresentLaneFence fence, uint64_t timeout_ms = 1000) const override;
+		bool WaitForPresentOpportunity(SwapChain* swapchain, double timeout_seconds, PresentTimingInfo* out_timing) override;
+		void SetSwapChainPreferredRefreshRate(SwapChain* swapchain, double refresh_hz) override;
+		void SetSwapChainHDRMetadata(SwapChain* swapchain, bool enable_hdr, float peak_nits) override;
+		uint64_t GetLastSubmitted3DFrameFenceValue() const override;
+		bool Is3DFrameFenceComplete(uint64_t fence_value) const override;
+		void* GetNativeDeviceHandle() const override;
+		void* GetNativeCompilerHandle() const override;
+		void* GetNativeCommandBufferHandle(CommandList cmd) const override;
+		void* GetNativeTextureHandle(const Texture* texture) const override;
+		void FlushCommandListForNativeHook(CommandList cmd) override;
 
 		void WaitForGPU() const override;
 		void ClearPipelineStateCache() override;
@@ -523,13 +585,16 @@ namespace wi::graphics
 
 		GPULinearAllocator& GetFrameAllocator(CommandList cmd) override
 		{
-			return GetCommandList(cmd).frame_allocators[GetBufferIndex()];
+			CommandList_Metal& commandlist = GetCommandList(cmd);
+			return commandlist.frame_allocators[commandlist.buffer_index];
 		}
 
 		struct AllocationHandler
 		{
 			std::mutex destroylocker;
 			uint64_t framecount = 0;
+			uint64_t present_epoch = 0;
+			std::deque<std::pair<uint64_t, uint64_t>> frame_present_barriers;
 			std::deque<std::pair<NS::SharedPtr<MTL::Resource>, uint64_t>> destroyer_resources;
 			std::deque<std::pair<NS::SharedPtr<MTL::SamplerState>, uint64_t>> destroyer_samplers;
 			std::deque<std::pair<NS::SharedPtr<MTL::Library>, uint64_t>> destroyer_libraries;
@@ -544,62 +609,81 @@ namespace wi::graphics
 			wi::vector<int> free_bindless_res;
 			wi::vector<int> free_bindless_sam;
 
-			void Update(uint64_t FRAMECOUNT, uint32_t BUFFERCOUNT)
+			void Update(uint64_t FRAMECOUNT, uint32_t BUFFERCOUNT, uint64_t completed_present_fence = ~0ull)
 			{
 				std::scoped_lock lck(destroylocker);
+				const uint64_t prev_framecount = framecount;
 				framecount = FRAMECOUNT;
-				while (!destroyer_resources.empty() && destroyer_resources.front().second + BUFFERCOUNT < FRAMECOUNT)
+				if (FRAMECOUNT > prev_framecount)
+				{
+					frame_present_barriers.push_back(std::make_pair(prev_framecount, present_epoch));
+				}
+				uint64_t safe_framecount = 0;
+				bool has_safe_framecount = false;
+				while (!frame_present_barriers.empty() &&
+					frame_present_barriers.front().first + BUFFERCOUNT < FRAMECOUNT &&
+					completed_present_fence >= frame_present_barriers.front().second)
+				{
+					safe_framecount = frame_present_barriers.front().first;
+					has_safe_framecount = true;
+					frame_present_barriers.pop_front();
+				}
+				if (!has_safe_framecount)
+				{
+					return;
+				}
+				while (!destroyer_resources.empty() && destroyer_resources.front().second <= safe_framecount)
 				{
 					remove_resident(destroyer_resources.front().first.get());
 					destroyer_resources.pop_front();
 					// SharedPtr auto delete
 				}
-				while (!destroyer_samplers.empty() && destroyer_samplers.front().second + BUFFERCOUNT < FRAMECOUNT)
+				while (!destroyer_samplers.empty() && destroyer_samplers.front().second <= safe_framecount)
 				{
 					destroyer_samplers.pop_front();
 					// SharedPtr auto delete
 				}
-				while (!destroyer_libraries.empty() && destroyer_libraries.front().second + BUFFERCOUNT < FRAMECOUNT)
+				while (!destroyer_libraries.empty() && destroyer_libraries.front().second <= safe_framecount)
 				{
 					destroyer_libraries.pop_front();
 					// SharedPtr auto delete
 				}
-				while (!destroyer_functions.empty() && destroyer_functions.front().second + BUFFERCOUNT < FRAMECOUNT)
+				while (!destroyer_functions.empty() && destroyer_functions.front().second <= safe_framecount)
 				{
 					destroyer_functions.pop_front();
 					// SharedPtr auto delete
 				}
-				while (!destroyer_render_pipelines.empty() && destroyer_render_pipelines.front().second + BUFFERCOUNT < FRAMECOUNT)
+				while (!destroyer_render_pipelines.empty() && destroyer_render_pipelines.front().second <= safe_framecount)
 				{
 					destroyer_render_pipelines.pop_front();
 					// SharedPtr auto delete
 				}
-				while (!destroyer_compute_pipelines.empty() && destroyer_compute_pipelines.front().second + BUFFERCOUNT < FRAMECOUNT)
+				while (!destroyer_compute_pipelines.empty() && destroyer_compute_pipelines.front().second <= safe_framecount)
 				{
 					destroyer_compute_pipelines.pop_front();
 					// SharedPtr auto delete
 				}
-				while (!destroyer_depth_stencil_states.empty() && destroyer_depth_stencil_states.front().second + BUFFERCOUNT < FRAMECOUNT)
+				while (!destroyer_depth_stencil_states.empty() && destroyer_depth_stencil_states.front().second <= safe_framecount)
 				{
 					destroyer_depth_stencil_states.pop_front();
 					// SharedPtr auto delete
 				}
-				while (!destroyer_counter_heaps.empty() && destroyer_counter_heaps.front().second + BUFFERCOUNT < FRAMECOUNT)
+				while (!destroyer_counter_heaps.empty() && destroyer_counter_heaps.front().second <= safe_framecount)
 				{
 					destroyer_counter_heaps.pop_front();
 					// SharedPtr auto delete
 				}
-				while (!destroyer_drawables.empty() && destroyer_drawables.front().second + BUFFERCOUNT < FRAMECOUNT)
+				while (!destroyer_drawables.empty() && destroyer_drawables.front().second <= safe_framecount)
 				{
 					destroyer_drawables.pop_front();
 					// SharedPtr auto delete
 				}
-				while (!destroyer_bindless_res.empty() && destroyer_bindless_res.front().second + BUFFERCOUNT < FRAMECOUNT)
+				while (!destroyer_bindless_res.empty() && destroyer_bindless_res.front().second <= safe_framecount)
 				{
 					free_bindless_res.push_back(destroyer_bindless_res.front().first);
 					destroyer_bindless_res.pop_front();
 				}
-				while (!destroyer_bindless_sam.empty() && destroyer_bindless_sam.front().second + BUFFERCOUNT < FRAMECOUNT)
+				while (!destroyer_bindless_sam.empty() && destroyer_bindless_sam.front().second <= safe_framecount)
 				{
 					free_bindless_sam.push_back(destroyer_bindless_sam.front().first);
 					destroyer_bindless_sam.pop_front();
@@ -626,18 +710,29 @@ namespace wi::graphics
 			}
 			
 			NS::SharedPtr<MTL::ResidencySet> residency_set;
+			bool residency_dirty = false;
 			void make_resident(const MTL::Resource* allocation)
 			{
 				if (allocation == nullptr)
 					return;
 				std::scoped_lock locker(destroylocker);
 				residency_set->addAllocation(allocation);
+				residency_dirty = true;
 			}
 			void remove_resident(const MTL::Allocation* allocation)
 			{
 				if (allocation == nullptr)
 					return;
 				residency_set->removeAllocation(allocation);
+				residency_dirty = true;
+			}
+			void commit_residency_locked()
+			{
+				if (residency_dirty && residency_set.get() != nullptr)
+				{
+					residency_set->commit();
+					residency_dirty = false;
+				}
 			}
 		};
 		wi::allocator::shared_ptr<AllocationHandler> allocationhandler;

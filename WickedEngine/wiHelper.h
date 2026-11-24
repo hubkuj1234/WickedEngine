@@ -121,6 +121,9 @@ namespace wi::helper
 	// Returns the file size if the file exists, otherwise 0
 	size_t FileSize(const std::string& fileName);
 
+	using FileReadHook = bool(*)(const std::string& fileName, std::vector<uint8_t>& outData);
+	void SetFileReadHook(FileReadHook hook);
+
 	bool FileRead(const std::string& fileName, wi::vector<uint8_t>& data, size_t max_read = ~0ull, size_t offset = 0);
 
 #if WI_VECTOR_TYPE
@@ -197,6 +200,9 @@ namespace wi::helper
 		Warning,
 		Error
 	};
+	using DebugOutHook = void(*)(const std::string& str, DebugLevel level);
+	void SetDebugOutHook(DebugOutHook hook);
+
 	void DebugOut(const std::string& str, DebugLevel level = DebugLevel::Normal);
 
 	// Puts the current thread to sleeping state for a given time (OS can overtake)

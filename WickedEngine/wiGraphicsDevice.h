@@ -20,6 +20,29 @@ namespace wi::graphics
 		constexpr bool IsValid() const { return internal_state != nullptr; }
 	};
 
+	struct PresentTimingInfo
+	{
+		double target_present_seconds = 0.0;
+		double refresh_interval_seconds = 1.0 / 60.0;
+		double last_actual_present_seconds = 0.0;
+		bool vrr_active = false;
+		bool timing_measured = false;
+	};
+
+	struct PresentLaneFence
+	{
+		uint64_t value = 0;
+	};
+
+	// Optional GLFW Vulkan surface creator callback (set by Daisy before CreateSwapChain).
+	// Signature: bool(void* vk_instance, void* window_handle, void* out_vk_surface_khr)
+	using VulkanSurfaceCreatorFn = bool(*)(void* vk_instance, void* window_handle, void* out_vk_surface_khr);
+	inline VulkanSurfaceCreatorFn& GetVulkanSurfaceCreator()
+	{
+		static VulkanSurfaceCreatorFn fn = nullptr;
+		return fn;
+	}
+
 	// Descriptor binding counts:
 	//	It's OK increase these limits if not enough
 	//	But it's better to refactor shaders to use bindless descriptors if they require more resources
@@ -123,6 +146,28 @@ namespace wi::graphics
 		// Submit all command list that were used with BeginCommandList before this call.
 		//	This will make every command list to be in "available" state and restarts them
 		virtual void SubmitCommandLists() = 0;
+
+		// Independent Present/UI submission lane (thread-safe concurrently with 3D SubmitCommandLists):
+		virtual CommandList BeginPresentCommandList() { return BeginCommandList(QUEUE_GRAPHICS); }
+		virtual PresentLaneFence SubmitPresentCommandList(CommandList cmd, const SwapChain* swapchain = nullptr) { (void)cmd; (void)swapchain; SubmitCommandLists(); return PresentLaneFence{ FRAMECOUNT }; }
+		virtual bool IsPresentFenceComplete(PresentLaneFence fence) const { (void)fence; return true; }
+		virtual void WaitPresentFence(PresentLaneFence fence, uint64_t timeout_ms = 1000) const { (void)fence; (void)timeout_ms; }
+
+		// Display timing & swapchain opportunity pacing:
+		virtual bool WaitForPresentOpportunity(SwapChain* swapchain, double timeout_seconds, PresentTimingInfo* out_timing) { (void)swapchain; (void)timeout_seconds; if (out_timing) *out_timing = {}; return true; }
+		virtual void SetSwapChainPreferredRefreshRate(SwapChain* swapchain, double refresh_hz) { (void)swapchain; (void)refresh_hz; }
+		virtual void SetSwapChainHDRMetadata(SwapChain* swapchain, bool enable_hdr, float peak_nits) { (void)swapchain; (void)enable_hdr; (void)peak_nits; }
+
+		// Non-blocking 3D timeline completion polling for lock-free offscreen mailbox:
+		virtual uint64_t GetLastSubmitted3DFrameFenceValue() const { return FRAMECOUNT; }
+		virtual bool Is3DFrameFenceComplete(uint64_t fence_value) const { (void)fence_value; return true; }
+
+		// Native handles for inline platform temporal upscaler / framegen SDKs (MTL4FX / DLSS / FSR3):
+		virtual void* GetNativeDeviceHandle() const { return nullptr; }
+		virtual void* GetNativeCompilerHandle() const { return nullptr; }
+		virtual void* GetNativeCommandBufferHandle(CommandList cmd) const { (void)cmd; return nullptr; }
+		virtual void* GetNativeTextureHandle(const Texture* texture) const { (void)texture; return nullptr; }
+		virtual void FlushCommandListForNativeHook(CommandList cmd) { (void)cmd; }
 
 		// The CPU will wait until all submitted GPU work is finished execution
 		virtual void WaitForGPU() const = 0;

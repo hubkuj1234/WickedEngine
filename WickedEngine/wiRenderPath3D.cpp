@@ -1026,6 +1026,7 @@ namespace wi
 		//	must finish before "main scene opaque color pass")
 		cmd = device->BeginCommandList(QUEUE_COMPUTE);
 		device->WaitCommandList(cmd, cmd_maincamera_prepass);
+		device->WaitCommandList(cmd, cmd_prepareframe_async);
 		CommandList cmd_maincamera_compute_effects = cmd;
 		wi::jobsystem::Execute(ctx, [this, cmd](wi::jobsystem::JobArgs args) {
 

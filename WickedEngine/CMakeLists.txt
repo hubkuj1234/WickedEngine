@@ -42,9 +42,9 @@ else ()
     if (PLATFORM STREQUAL "SDL3")
         find_package(SDL3 REQUIRED CONFIG)
     else ()
-        find_package(SDL2 REQUIRED)
+        # find_package(SDL2 REQUIRED)
 
-        if(NOT TARGET SDL2::SDL2)
+        if(FALSE) # DAISY_SKIP_SDL2_TARGET
             # using old SDL2 cmake, lets create a SDL2 target ourselves
             find_library(SDL2_LIBRARY_FILE_LOCATION SDL2 REQUIRED)
 
@@ -78,7 +78,9 @@ add_subdirectory(LUA)
 add_subdirectory(Utility)
 
 set(PHYSICS_REPO_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
-include(${PHYSICS_REPO_ROOT}/Jolt/Jolt.cmake)
+if(NOT TARGET Jolt)
+    include(${PHYSICS_REPO_ROOT}/Jolt/Jolt.cmake)
+endif()
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     # Jolt triggers a bug in some GCC versions, so we need to disable the warning
     target_compile_options(Jolt PRIVATE -Wno-stringop-overflow)
@@ -94,6 +96,7 @@ file(GLOB SOURCE_FILES CONFIGURE_DEPENDS *.cpp)
 list(REMOVE_ITEM SOURCE_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/offlineshadercompiler.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/wiRenderer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/wiJobSystem.cpp # DAISY_SKIP_WE_JOBSYSTEM
 )
 
 file(GLOB SHADER_FILES CONFIGURE_DEPENDS shaders/*.hlsl shaders/*.hlsli)
@@ -146,9 +149,7 @@ set_target_properties(${TARGET_NAME} PROPERTIES
     OUTPUT_NAME "WickedEngine"
 )
 
-target_precompile_headers(WickedEngine_common PRIVATE WickedEngine.h)
-target_precompile_headers(WickedEngine_emb_shaders REUSE_FROM WickedEngine_common)
-target_precompile_headers(WickedEngine_ext_shaders REUSE_FROM WickedEngine_common)
+# DAISY_SKIP_WE_PCH: Apple Clang 21 bus-errors on the WickedEngine PCH
 
 set_target_properties(WickedEngine_common PROPERTIES
     PUBLIC_HEADER "${HEADER_FILES}"
@@ -256,15 +257,17 @@ else ()
 
     target_link_libraries(WickedEngine_common PUBLIC
         Threads::Threads
-        ${WICKED_SDL_TARGET}
+        # ${WICKED_SDL_TARGET}
         $<$<BOOL:${OpenImageDenoise_FOUND}>:OpenImageDenoise> # links OpenImageDenoise only if it's found
     )
 
+    if(TARGET FAudio)
     set_target_properties(FAudio PROPERTIES
         POSITION_INDEPENDENT_CODE ${WICKED_PIC}
         UNITY_BUILD NO
     )
     set(WICKEDENGINE_STATIC_LIBRARIES ${WICKEDENGINE_STATIC_LIBRARIES} FAudio)
+    endif()
 
     target_link_libraries(WickedEngine_common PUBLIC dl)
 

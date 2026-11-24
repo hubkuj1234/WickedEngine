@@ -228,6 +228,10 @@ namespace wi::physics
 			{
 				return inLayer == Layers::MOVING ? BroadPhaseLayers::DYNAMIC : BroadPhaseLayers::STATIC;
 			}
+			virtual const char* GetBroadPhaseLayerName(BroadPhaseLayer inLayer) const override
+			{
+				return inLayer == BroadPhaseLayers::DYNAMIC ? "DYNAMIC" : "STATIC";
+			}
 		};
 
 		/// Class that determines if an object layer can collide with a broadphase layer

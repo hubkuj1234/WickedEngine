@@ -2178,7 +2178,7 @@ namespace wi::scene
 		desc.height = resolution;
 		desc.width = resolution;
 		desc.usage = Usage::DEFAULT;
-		desc.format = Format::BC6H_UF16;
+		desc.format = Format::R16G16B16A16_FLOAT; // DAISY_ENVPROBE_RGBA16F
 		desc.sample_count = 1; // Note that this texture is always non-MSAA, even if probe is rendered as MSAA, because this contains resolved result
 		desc.bind_flags = BindFlag::SHADER_RESOURCE;
 		desc.mip_levels = GetMipCount(resolution, resolution, 1, 16);

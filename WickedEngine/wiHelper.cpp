@@ -1305,9 +1305,27 @@ namespace wi::helper
 		return 0;
 	}
 
+	static std::atomic<FileReadHook> g_daisy_file_read_hook{ nullptr };
+	void SetFileReadHook(FileReadHook hook)
+	{
+		g_daisy_file_read_hook.store(hook, std::memory_order_release);
+	}
+
 	template<template<typename T, typename A> typename vector_interface>
 	bool FileRead_Impl(const std::string& fileName, vector_interface<uint8_t, std::allocator<uint8_t>>& data, size_t max_read, size_t offset)
 	{
+		if (offset == 0 && max_read == ~0ull)
+		{
+			if (FileReadHook hook = g_daisy_file_read_hook.load(std::memory_order_acquire))
+			{
+				std::vector<uint8_t> hooked;
+				if (hook(fileName, hooked))
+				{
+					data.assign(hooked.begin(), hooked.end());
+					return true;
+				}
+			}
+		}
 #ifdef _WIN32
 		std::ifstream file(ToNativeString(fileName), std::ios::binary | std::ios::ate);
 #else
@@ -1992,8 +2010,19 @@ namespace wi::helper
 		return str.substr(0, found + 2);
 	}
 
+	static std::atomic<DebugOutHook> g_daisy_debug_out_hook{ nullptr };
+	void SetDebugOutHook(DebugOutHook hook)
+	{
+		g_daisy_debug_out_hook.store(hook, std::memory_order_release);
+	}
+
 	void DebugOut(const std::string& str, DebugLevel level)
 	{
+		if (DebugOutHook hook = g_daisy_debug_out_hook.load(std::memory_order_acquire))
+		{
+			hook(str, level);
+			return;
+		}
 #ifdef _WIN32
 		std::wstring wstr = ToNativeString(str);
 		OutputDebugString(wstr.c_str());

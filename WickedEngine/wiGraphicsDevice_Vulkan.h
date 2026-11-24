@@ -533,7 +533,17 @@ namespace wi::graphics
 		}
 
 		VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+		mutable std::mutex pipelines_global_locker;
 		wi::unordered_map<PipelineHash, PipelineState> pipelines_global;
+
+		static constexpr uint32_t kPresentSlotCount = 3;
+		CommandList_Vulkan present_cmd_slots[kPresentSlotCount];
+		VkFence present_slot_fences[kPresentSlotCount] = {};
+		uint64_t present_slot_fence_values[kPresentSlotCount] = {};
+		uint64_t present_fence_counter = 0;
+		uint32_t present_slot_cursor = 0;
+		std::atomic<uint64_t> timeline_3d_submitted{ 0 };
+		uint64_t frame_submitted_value[BUFFERCOUNT] = {};
 
 		void pso_validate(CommandList cmd);
 
@@ -575,6 +585,17 @@ namespace wi::graphics
 
 		CommandList BeginCommandList(QUEUE_TYPE queue = QUEUE_GRAPHICS) override;
 		void SubmitCommandLists() override;
+		CommandList BeginPresentCommandList() override;
+		PresentLaneFence SubmitPresentCommandList(CommandList cmd, const SwapChain* swapchain = nullptr) override;
+		bool IsPresentFenceComplete(PresentLaneFence fence) const override;
+		void WaitPresentFence(PresentLaneFence fence, uint64_t timeout_ms = 1000) const override;
+		bool WaitForPresentOpportunity(SwapChain* swapchain, double timeout_seconds, PresentTimingInfo* out_timing) override;
+		uint64_t GetLastSubmitted3DFrameFenceValue() const override;
+		bool Is3DFrameFenceComplete(uint64_t fence_value) const override;
+		void* GetNativeDeviceHandle() const override;
+		void* GetNativeCommandBufferHandle(CommandList cmd) const override;
+		void* GetNativeTextureHandle(const Texture* texture) const override;
+		void FlushCommandListForNativeHook(CommandList cmd) override;
 
 		void WaitForGPU() const override;
 		void ClearPipelineStateCache() override;
@@ -702,7 +723,8 @@ namespace wi::graphics
 
 		GPULinearAllocator& GetFrameAllocator(CommandList cmd) override
 		{
-			return GetCommandList(cmd).frame_allocators[GetBufferIndex()];
+			CommandList_Vulkan& commandlist = GetCommandList(cmd);
+			return commandlist.frame_allocators[commandlist.buffer_index];
 		}
 
 		VkDevice GetDevice();
