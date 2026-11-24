@@ -417,6 +417,12 @@ namespace wi::graphics
 		IRDescriptorTableEntry* descriptor_heap_sam_data = nullptr;
 		Texture nullTexture; // descriptor safety feature: bindless resource index 0 (see the constructor)
 		Sampler nullSampler; // descriptor safety feature: bindless sampler index 0 (see the constructor)
+		NS::SharedPtr<MTL::ComputePipelineState> clear_uav_pso_2d_float;
+		NS::SharedPtr<MTL::ComputePipelineState> clear_uav_pso_2d_uint;
+		NS::SharedPtr<MTL::ComputePipelineState> clear_uav_pso_2d_array_float;
+		NS::SharedPtr<MTL::ComputePipelineState> clear_uav_pso_2d_array_uint;
+		NS::SharedPtr<MTL::ComputePipelineState> clear_uav_pso_3d_float;
+		NS::SharedPtr<MTL::ComputePipelineState> clear_uav_pso_3d_uint;
 		
 #ifdef USE_TEXTURE_VIEW_POOL
 		NS::SharedPtr<MTL::TextureViewPool> texture_view_pool;

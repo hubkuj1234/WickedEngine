@@ -1351,9 +1351,160 @@ using namespace metal_internal;
 	}
 
 	void GraphicsDevice_Metal::clear_flush(CommandList cmd)
-{
+	{
 		CommandList_Metal& commandlist = GetCommandList(cmd);
+		if (commandlist.texture_clears.empty())
+			return;
+
+		if (commandlist.render_encoder.get() != nullptr)
+		{
+			// Never interrupt an active render pass for a compute UAV clear.
+			commandlist.texture_clears.clear();
+			return;
+		}
+		if (commandlist.compute_encoder.get() == nullptr)
+		{
+			NS::SharedPtr<NS::AutoreleasePool> ap = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+			commandlist.compute_encoder = NS::TransferPtr(commandlist.commandbuffer->computeCommandEncoder()->retain());
+			commandlist.compute_encoder->barrierAfterQueueStages(MTL::StageAll, MTL::StageAll, MTL4::VisibilityOptionDevice);
+		}
+
+		auto is_integer_format = [](MTL::PixelFormat pf) -> bool {
+			switch (pf)
+			{
+				case MTL::PixelFormatR8Uint:
+				case MTL::PixelFormatR8Sint:
+				case MTL::PixelFormatR16Uint:
+				case MTL::PixelFormatR16Sint:
+				case MTL::PixelFormatRG8Uint:
+				case MTL::PixelFormatRG8Sint:
+				case MTL::PixelFormatR32Uint:
+				case MTL::PixelFormatR32Sint:
+				case MTL::PixelFormatRG16Uint:
+				case MTL::PixelFormatRG16Sint:
+				case MTL::PixelFormatRGBA8Uint:
+				case MTL::PixelFormatRGBA8Sint:
+				case MTL::PixelFormatRGB10A2Uint:
+				case MTL::PixelFormatRG32Uint:
+				case MTL::PixelFormatRG32Sint:
+				case MTL::PixelFormatRGBA16Uint:
+				case MTL::PixelFormatRGBA16Sint:
+				case MTL::PixelFormatRGBA32Uint:
+				case MTL::PixelFormatRGBA32Sint:
+					return true;
+				default:
+					return false;
+			}
+		};
+
+		NS::SharedPtr<NS::AutoreleasePool> autorelease_pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+		bool dispatched_any = false;
+		for (auto& x : commandlist.texture_clears)
+		{
+			MTL::Texture* tex = x.first.get();
+			if (tex == nullptr || !(tex->usage() & MTL::TextureUsageShaderWrite))
+				continue;
+
+			const MTL::TextureType tex_type = tex->textureType();
+			const bool is_3d = (tex_type == MTL::TextureType3D);
+			const bool is_cube = (tex_type == MTL::TextureTypeCube || tex_type == MTL::TextureTypeCubeArray);
+			const bool is_array = is_cube || (tex_type == MTL::TextureType2DArray);
+			const bool is_2d = (tex_type == MTL::TextureType2D);
+			if (!is_2d && !is_array && !is_3d)
+				continue;
+
+			const bool is_uint = is_integer_format(tex->pixelFormat());
+			MTL::ComputePipelineState* pso = nullptr;
+			if (is_3d)
+				pso = is_uint ? clear_uav_pso_3d_uint.get() : clear_uav_pso_3d_float.get();
+			else if (is_array)
+				pso = is_uint ? clear_uav_pso_2d_array_uint.get() : clear_uav_pso_2d_array_float.get();
+			else
+				pso = is_uint ? clear_uav_pso_2d_uint.get() : clear_uav_pso_2d_float.get();
+			if (pso == nullptr)
+				continue;
+
+			const uint32_t value = x.second;
+			GPUAllocation alloc = AllocateGPU(16, cmd);
+			if (!alloc.IsValid())
+				continue;
+			if (is_uint)
+			{
+				uint32_t v[4] = { value, value, value, value };
+				std::memcpy(alloc.data, v, sizeof(v));
+			}
+			else
+			{
+				float v[4] = {
+					(value & 0xFFu) / 255.0f,
+					((value >> 8u) & 0xFFu) / 255.0f,
+					((value >> 16u) & 0xFFu) / 255.0f,
+					((value >> 24u) & 0xFFu) / 255.0f
+				};
+				std::memcpy(alloc.data, v, sizeof(v));
+			}
+			auto buf_internal = to_internal(&alloc.buffer);
+			const MTL::GPUAddress val_gpu_addr = buf_internal->gpu_address + alloc.offset;
+
+			const NS::UInteger mips = tex->mipmapLevelCount();
+			const NS::UInteger total_slices = tex->arrayLength() * (is_cube ? 6u : 1u);
+			const NS::UInteger w0 = tex->width();
+			const NS::UInteger h0 = tex->height();
+			const NS::UInteger d0 = tex->depth();
+
+			commandlist.compute_encoder->setComputePipelineState(pso);
+			for (NS::UInteger mip = 0; mip < mips; ++mip)
+			{
+				NS::SharedPtr<MTL::Texture> mip_view;
+				MTL::Texture* target_tex = tex;
+				if (mip > 0 || is_cube)
+				{
+					MTL::TextureType view_type = is_3d ? MTL::TextureType3D : (is_array ? MTL::TextureType2DArray : MTL::TextureType2D);
+					mip_view = NS::TransferPtr(tex->newTextureView(
+						tex->pixelFormat(),
+						view_type,
+						NS::Range::Make(mip, 1),
+						NS::Range::Make(0, total_slices)));
+					if (mip_view.get() == nullptr)
+						continue;
+					target_tex = mip_view.get();
+					std::scoped_lock lck(allocationhandler->destroylocker);
+					allocationhandler->destroyer_resources.push_back(std::make_pair(mip_view, allocationhandler->framecount));
+				}
+
+				const NS::UInteger w = std::max<NS::UInteger>(1, w0 >> mip);
+				const NS::UInteger h = std::max<NS::UInteger>(1, h0 >> mip);
+				const NS::UInteger z = is_3d ? std::max<NS::UInteger>(1, d0 >> mip) : (is_array ? total_slices : 1u);
+
+				commandlist.argument_table->setTexture(target_tex->gpuResourceID(), 0);
+				commandlist.argument_table->setAddress(val_gpu_addr, 29);
+				commandlist.compute_encoder->setArgumentTable(commandlist.argument_table.get());
+
+				if (is_3d || is_array)
+				{
+					const NS::UInteger tz = is_3d ? 4u : 1u;
+					commandlist.compute_encoder->dispatchThreadgroups(
+						MTL::Size::Make((w + 7u) / 8u, (h + 7u) / 8u, (z + tz - 1u) / tz),
+						MTL::Size::Make(8u, 8u, tz));
+				}
+				else
+				{
+					commandlist.compute_encoder->dispatchThreadgroups(
+						MTL::Size::Make((w + 7u) / 8u, (h + 7u) / 8u, 1u),
+						MTL::Size::Make(8u, 8u, 1u));
+				}
+				dispatched_any = true;
+			}
+		}
 		commandlist.texture_clears.clear();
+		if (dispatched_any)
+		{
+			commandlist.compute_encoder->barrierAfterStages(MTL::StageDispatch, MTL::StageAll, MTL4::VisibilityOptionDevice);
+			commandlist.dirty_cs = true;
+			commandlist.dirty_root = true;
+			commandlist.dirty_resource = true;
+			commandlist.dirty_sampler = true;
+		}
 	}
 
 	void GraphicsDevice_Metal::pso_validate(CommandList cmd)
@@ -1620,7 +1771,7 @@ using namespace metal_internal;
 		argument_table_desc->setInitializeBindings(false);
 		argument_table_desc->setSupportAttributeStrides(true);
 		argument_table_desc->setMaxBufferBindCount(31);
-		argument_table_desc->setMaxTextureBindCount(0);
+		argument_table_desc->setMaxTextureBindCount(1);
 		argument_table_desc->setMaxSamplerStateBindCount(0);
 		
 #ifdef PLATFORM_IOS
@@ -1802,6 +1953,60 @@ using namespace metal_internal;
 			SamplerDesc desc;
 			CreateSampler(&desc, &nullSampler);
 			descriptor_heap_sam_data[index] = to_internal(&nullSampler)->entry;
+		}
+
+		// Compute kernels for ClearUAV(texture) across 2D, 2DArray/Cube, and 3D (float/unorm & uint/sint).
+		// Avoids TBDR draw-less render passes on UAV textures while keeping VXGI/SSGI clears exact.
+		{
+			static const char* kClearUAVMetalSrc = R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void clear_2d_f(texture2d<float, access::write> t [[texture(0)]], constant float4& v [[buffer(29)]], uint2 gid [[thread_position_in_grid]]) {
+	if (gid.x < t.get_width() && gid.y < t.get_height()) t.write(v, gid);
+}
+kernel void clear_2d_u(texture2d<uint, access::write> t [[texture(0)]], constant uint4& v [[buffer(29)]], uint2 gid [[thread_position_in_grid]]) {
+	if (gid.x < t.get_width() && gid.y < t.get_height()) t.write(v, gid);
+}
+kernel void clear_2da_f(texture2d_array<float, access::write> t [[texture(0)]], constant float4& v [[buffer(29)]], uint3 gid [[thread_position_in_grid]]) {
+	if (gid.x < t.get_width() && gid.y < t.get_height() && gid.z < t.get_array_size()) t.write(v, gid.xy, gid.z);
+}
+kernel void clear_2da_u(texture2d_array<uint, access::write> t [[texture(0)]], constant uint4& v [[buffer(29)]], uint3 gid [[thread_position_in_grid]]) {
+	if (gid.x < t.get_width() && gid.y < t.get_height() && gid.z < t.get_array_size()) t.write(v, gid.xy, gid.z);
+}
+kernel void clear_3d_f(texture3d<float, access::write> t [[texture(0)]], constant float4& v [[buffer(29)]], uint3 gid [[thread_position_in_grid]]) {
+	if (gid.x < t.get_width() && gid.y < t.get_height() && gid.z < t.get_depth()) t.write(v, gid);
+}
+kernel void clear_3d_u(texture3d<uint, access::write> t [[texture(0)]], constant uint4& v [[buffer(29)]], uint3 gid [[thread_position_in_grid]]) {
+	if (gid.x < t.get_width() && gid.y < t.get_height() && gid.z < t.get_depth()) t.write(v, gid);
+}
+)";
+			NS::SharedPtr<NS::String> src = NS::TransferPtr(NS::String::alloc()->init(kClearUAVMetalSrc, NS::UTF8StringEncoding));
+			NS::Error* err = nullptr;
+			NS::SharedPtr<MTL::Library> lib = NS::TransferPtr(device->newLibrary(src.get(), nullptr, &err));
+			if (err != nullptr)
+			{
+				wilog_error("ClearUAV Metal library compile failed: %s", err->localizedDescription()->utf8String());
+				err->release();
+				err = nullptr;
+			}
+			if (lib.get() != nullptr)
+			{
+				auto make_pso = [&](const char* fn_name) -> NS::SharedPtr<MTL::ComputePipelineState> {
+					NS::SharedPtr<NS::String> name = NS::TransferPtr(NS::String::alloc()->init(fn_name, NS::UTF8StringEncoding));
+					NS::SharedPtr<MTL::Function> fn = NS::TransferPtr(lib->newFunction(name.get()));
+					if (fn.get() == nullptr) return {};
+					NS::Error* pso_err = nullptr;
+					auto pso = NS::TransferPtr(device->newComputePipelineState(fn.get(), &pso_err));
+					if (pso_err != nullptr) pso_err->release();
+					return pso;
+				};
+				clear_uav_pso_2d_float = make_pso("clear_2d_f");
+				clear_uav_pso_2d_uint = make_pso("clear_2d_u");
+				clear_uav_pso_2d_array_float = make_pso("clear_2da_f");
+				clear_uav_pso_2d_array_uint = make_pso("clear_2da_u");
+				clear_uav_pso_3d_float = make_pso("clear_3d_f");
+				clear_uav_pso_3d_uint = make_pso("clear_3d_u");
+			}
 		}
 		
 		wilog("Created GraphicsDevice_Metal (%d ms)", (int)std::round(timer.elapsed()));
