@@ -1774,6 +1774,35 @@ using namespace metal_internal;
 		timeline_3d_event->setSignaledValue(0);
 
 		copyAllocator.init(this);
+
+		// Descriptor safety feature (upstream WickedEngine #1744):
+		// Init permanent resident null descriptors at bindless index 0 so speculative
+		// shader loads outside safety branches never dereference NULL/evicted memory.
+		{
+			int index = allocationhandler->free_bindless_res.back();
+			allocationhandler->free_bindless_res.pop_back();
+			wilog_assert(index == 0, "Descriptor safety feature error: descriptor index must be 0!");
+			TextureDesc desc;
+			desc.width = 1;
+			desc.height = 1;
+			desc.format = Format::R8G8B8A8_UNORM;
+			desc.bind_flags = BindFlag::SHADER_RESOURCE;
+			const uint32_t zero = 0;
+			SubresourceData data;
+			data.data_ptr = &zero;
+			data.row_pitch = sizeof(zero);
+			CreateTexture(&desc, &data, &nullTexture);
+			SetName(&nullTexture, "nullTexture");
+			descriptor_heap_res_data[index] = to_internal(&nullTexture)->srv.entry;
+		}
+		{
+			int index = allocationhandler->free_bindless_sam.back();
+			allocationhandler->free_bindless_sam.pop_back();
+			wilog_assert(index == 0, "Descriptor safety feature error: descriptor index must be 0!");
+			SamplerDesc desc;
+			CreateSampler(&desc, &nullSampler);
+			descriptor_heap_sam_data[index] = to_internal(&nullSampler)->entry;
+		}
 		
 		wilog("Created GraphicsDevice_Metal (%d ms)", (int)std::round(timer.elapsed()));
 	}
@@ -3443,6 +3472,7 @@ using namespace metal_internal;
 		commandlist.id = cmd_current;
 		commandlist.commandallocators[GetBufferIndex()]->reset();
 		commandlist.commandbuffer->beginCommandBuffer(commandlist.commandallocators[GetBufferIndex()].get());
+		commandlist.commandbuffer->setLabel(nullptr);
 		commandlist.argument_table->setAddress(descriptor_heap_res->gpuAddress(), kIRDescriptorHeapBindPoint);
 		commandlist.argument_table->setAddress(descriptor_heap_sam->gpuAddress(), kIRSamplerHeapBindPoint);
 		
@@ -3760,6 +3790,7 @@ using namespace metal_internal;
 		commandlist.id = 0x80000000u | slot;
 		commandlist.commandallocators[0]->reset();
 		commandlist.commandbuffer->beginCommandBuffer(commandlist.commandallocators[0].get());
+		commandlist.commandbuffer->setLabel(nullptr);
 		commandlist.argument_table->setAddress(descriptor_heap_res->gpuAddress(), kIRDescriptorHeapBindPoint);
 		commandlist.argument_table->setAddress(descriptor_heap_sam->gpuAddress(), kIRSamplerHeapBindPoint);
 		CommandList cmd;
@@ -5118,7 +5149,7 @@ using namespace metal_internal;
 					commandlist.compute_encoder->endEncoding();
 					commandlist.compute_encoder.reset();
 				}
-				commandlist.commandbuffer->resolveCounterHeap(internal_state->counter_heap.get(), {index, count}, {dst_internal->gpu_address, count * sizeof(uint64_t)}, nullptr, nullptr);
+				commandlist.commandbuffer->resolveCounterHeap(internal_state->counter_heap.get(), {index, count}, {dst_internal->gpu_address + dest_offset, count * sizeof(uint64_t)}, nullptr, nullptr);
 				break;
 			default:
 				break;
@@ -5514,6 +5545,10 @@ using namespace metal_internal;
 	{
 		CommandList_Metal& commandlist = GetCommandList(cmd);
 		NS::SharedPtr<NS::String> str = NS::TransferPtr(NS::String::alloc()->init(name, NS::UTF8StringEncoding));
+		if (commandlist.commandbuffer->label() == nullptr)
+		{
+			commandlist.commandbuffer->setLabel(str.get());
+		}
 		if (commandlist.render_encoder.get() != nullptr)
 		{
 			commandlist.render_encoder->pushDebugGroup(str.get());
@@ -5547,6 +5582,10 @@ using namespace metal_internal;
 	{
 		CommandList_Metal& commandlist = GetCommandList(cmd);
 		NS::SharedPtr<NS::String> str = NS::TransferPtr(NS::String::alloc()->init(name, NS::UTF8StringEncoding));
+		if (commandlist.commandbuffer->label() == nullptr)
+		{
+			commandlist.commandbuffer->setLabel(str.get());
+		}
 		if (commandlist.render_encoder.get() != nullptr)
 		{
 			commandlist.render_encoder->setLabel(str.get());

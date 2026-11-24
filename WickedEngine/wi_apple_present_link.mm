@@ -373,20 +373,32 @@ void CommitMetal4CommandBuffers(void* mtl4_queue,
             static std::atomic<uint64_t> s_commit_seq{0};
             const uint64_t seq = s_commit_seq.fetch_add(1, std::memory_order_relaxed);
             auto* cbs = reinterpret_cast<const id<MTL4CommandBuffer> __unsafe_unretained*>(cmd_buffers);
+            NSString* cb_labels = @"";
+            for (size_t i = 0; i < count; ++i) {
+                NSString* l = cbs[i].label;
+                if (l && l.length > 0) {
+                    cb_labels = cb_labels.length > 0
+                        ? [cb_labels stringByAppendingFormat:@",%@", l]
+                        : l;
+                }
+            }
             MTL4CommitOptions* opts = [[MTL4CommitOptions alloc] init];
             [opts addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
                 NSError* err = feedback.error;
                 if (err != nil) {
+                    NSString* info = err.userInfo.count > 0 ? err.userInfo.description : @"{}";
                     std::fprintf(
                         stderr,
-                        "[Metal4 CommitFeedback ERROR] queue=%s seq=%llu count=%zu gpu=%.1fms domain=%s code=%ld desc=%s\n",
+                        "[Metal4 CommitFeedback ERROR] queue=%s seq=%llu count=%zu labels=[%s] gpu=%.1fms domain=%s code=%ld desc=%s info=%s\n",
                         label,
                         static_cast<unsigned long long>(seq),
                         count,
+                        cb_labels.UTF8String,
                         (feedback.GPUEndTime - feedback.GPUStartTime) * 1000.0,
                         err.domain ? err.domain.UTF8String : "(null)",
                         static_cast<long>(err.code),
-                        err.localizedDescription ? err.localizedDescription.UTF8String : "(null)");
+                        err.localizedDescription ? err.localizedDescription.UTF8String : "(null)",
+                        info.UTF8String);
                     std::fflush(stderr);
                 }
             }];
