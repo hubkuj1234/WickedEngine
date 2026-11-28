@@ -97,6 +97,7 @@ list(REMOVE_ITEM SOURCE_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/offlineshadercompiler.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/wiRenderer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/wiJobSystem.cpp # DAISY_SKIP_WE_JOBSYSTEM
+    ${CMAKE_CURRENT_SOURCE_DIR}/wiPhysics_Jolt.cpp # DAISY_SKIP_WE_PHYSICS (Daisy owns Jolt with DOUBLE_PRECISION)
 )
 
 file(GLOB SHADER_FILES CONFIGURE_DEPENDS shaders/*.hlsl shaders/*.hlsli)

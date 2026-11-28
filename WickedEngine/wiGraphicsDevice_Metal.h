@@ -604,6 +604,8 @@ namespace wi::graphics
 			uint64_t present_epoch = 0;
 			std::deque<std::pair<uint64_t, uint64_t>> frame_present_barriers;
 			std::deque<std::pair<NS::SharedPtr<MTL::Resource>, uint64_t>> destroyer_resources;
+			std::deque<std::pair<NS::SharedPtr<MTL::Resource>, uint64_t>> destroyer_nonresident_resources;
+			std::deque<std::pair<NS::SharedPtr<MTL::Heap>, uint64_t>> destroyer_heaps;
 			std::deque<std::pair<NS::SharedPtr<MTL::SamplerState>, uint64_t>> destroyer_samplers;
 			std::deque<std::pair<NS::SharedPtr<MTL::Library>, uint64_t>> destroyer_libraries;
 			std::deque<std::pair<NS::SharedPtr<MTL::Function>, uint64_t>> destroyer_functions;
@@ -640,10 +642,21 @@ namespace wi::graphics
 				{
 					return;
 				}
+				while (!destroyer_nonresident_resources.empty() && destroyer_nonresident_resources.front().second <= safe_framecount)
+				{
+					destroyer_nonresident_resources.pop_front();
+					// SharedPtr auto delete (heap-placed buffers & views inherit residency from parent heap/resource)
+				}
 				while (!destroyer_resources.empty() && destroyer_resources.front().second <= safe_framecount)
 				{
 					remove_resident(destroyer_resources.front().first.get());
 					destroyer_resources.pop_front();
+					// SharedPtr auto delete
+				}
+				while (!destroyer_heaps.empty() && destroyer_heaps.front().second <= safe_framecount)
+				{
+					remove_resident(destroyer_heaps.front().first.get());
+					destroyer_heaps.pop_front();
 					// SharedPtr auto delete
 				}
 				while (!destroyer_samplers.empty() && destroyer_samplers.front().second <= safe_framecount)
@@ -719,7 +732,7 @@ namespace wi::graphics
 			
 			NS::SharedPtr<MTL::ResidencySet> residency_set;
 			bool residency_dirty = false;
-			void make_resident(const MTL::Resource* allocation)
+			void make_resident(const MTL::Allocation* allocation)
 			{
 				if (allocation == nullptr)
 					return;

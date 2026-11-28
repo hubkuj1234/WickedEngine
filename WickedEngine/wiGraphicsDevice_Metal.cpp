@@ -710,8 +710,10 @@ namespace metal_internal
 	struct Buffer_Metal
 	{
 		wi::allocator::shared_ptr<GraphicsDevice_Metal::AllocationHandler> allocationhandler;
+		NS::SharedPtr<MTL::Heap> heap;
 		NS::SharedPtr<MTL::Buffer> buffer;
 		MTL::GPUAddress gpu_address = {};
+		bool resident_in_set = false;
 		
 		struct Subresource
 		{
@@ -735,15 +737,19 @@ namespace metal_internal
 			uint64_t framecount = allocationhandler->framecount;
 			
 #ifndef USE_TEXTURE_VIEW_POOL
-			allocationhandler->destroyer_resources.push_back(std::make_pair(srv.view, framecount));
-			allocationhandler->destroyer_resources.push_back(std::make_pair(uav.view, framecount));
+			if (srv.view.get() != nullptr)
+				allocationhandler->destroyer_nonresident_resources.push_back(std::make_pair(std::move(srv.view), framecount));
+			if (uav.view.get() != nullptr)
+				allocationhandler->destroyer_nonresident_resources.push_back(std::make_pair(std::move(uav.view), framecount));
 			for (auto& x : subresources_srv)
 			{
-				allocationhandler->destroyer_resources.push_back(std::make_pair(x.view, framecount));
+				if (x.view.get() != nullptr)
+					allocationhandler->destroyer_nonresident_resources.push_back(std::make_pair(std::move(x.view), framecount));
 			}
 			for (auto& x : subresources_uav)
 			{
-				allocationhandler->destroyer_resources.push_back(std::make_pair(x.view, framecount));
+				if (x.view.get() != nullptr)
+					allocationhandler->destroyer_nonresident_resources.push_back(std::make_pair(std::move(x.view), framecount));
 			}
 #endif // USE_TEXTURE_VIEW_POOL
 			
@@ -775,8 +781,18 @@ namespace metal_internal
 				return;
 			allocationhandler->destroylocker.lock();
 			uint64_t framecount = allocationhandler->framecount;
-			allocationhandler->destroyer_resources.push_back(std::make_pair(std::move(buffer), framecount));
 			destroy_subresources();
+			if (buffer.get() != nullptr)
+			{
+				if (resident_in_set)
+					allocationhandler->destroyer_resources.push_back(std::make_pair(std::move(buffer), framecount));
+				else
+					allocationhandler->destroyer_nonresident_resources.push_back(std::make_pair(std::move(buffer), framecount));
+			}
+			if (heap.get() != nullptr)
+			{
+				allocationhandler->destroyer_heaps.push_back(std::make_pair(std::move(heap), framecount));
+			}
 			allocationhandler->destroylocker.unlock();
 		}
 	};
@@ -821,15 +837,19 @@ namespace metal_internal
 			uint64_t framecount = allocationhandler->framecount;
 			
 #ifndef USE_TEXTURE_VIEW_POOL
-			allocationhandler->destroyer_resources.push_back(std::make_pair(srv.view, framecount));
-			allocationhandler->destroyer_resources.push_back(std::make_pair(uav.view, framecount));
+			if (srv.view.get() != nullptr)
+				allocationhandler->destroyer_nonresident_resources.push_back(std::make_pair(std::move(srv.view), framecount));
+			if (uav.view.get() != nullptr)
+				allocationhandler->destroyer_nonresident_resources.push_back(std::make_pair(std::move(uav.view), framecount));
 			for (auto& x : subresources_srv)
 			{
-				allocationhandler->destroyer_resources.push_back(std::make_pair(x.view, framecount));
+				if (x.view.get() != nullptr)
+					allocationhandler->destroyer_nonresident_resources.push_back(std::make_pair(std::move(x.view), framecount));
 			}
 			for (auto& x : subresources_uav)
 			{
-				allocationhandler->destroyer_resources.push_back(std::make_pair(x.view, framecount));
+				if (x.view.get() != nullptr)
+					allocationhandler->destroyer_nonresident_resources.push_back(std::make_pair(std::move(x.view), framecount));
 			}
 #endif // USE_TEXTURE_VIEW_POOL
 			
@@ -1469,7 +1489,7 @@ using namespace metal_internal;
 						continue;
 					target_tex = mip_view.get();
 					std::scoped_lock lck(allocationhandler->destroylocker);
-					allocationhandler->destroyer_resources.push_back(std::make_pair(mip_view, allocationhandler->framecount));
+					allocationhandler->destroyer_nonresident_resources.push_back(std::make_pair(mip_view, allocationhandler->framecount));
 				}
 
 				const NS::UInteger w = std::max<NS::UInteger>(1, w0 >> mip);
@@ -2123,14 +2143,22 @@ kernel void clear_3d_u(texture3d<uint, access::write> t [[texture(0)]], constant
 			heap_desc->setResourceOptions(resource_options);
 			heap_desc->setSize(sizealign.size);
 			heap_desc->setType(MTL::HeapTypePlacement);
-			heap_desc->setMaxCompatiblePlacementSparsePageSize(sparse_page_size);
+			if ((resource_options & MTL::ResourceStorageModePrivate) != 0)
+			{
+				heap_desc->setMaxCompatiblePlacementSparsePageSize(sparse_page_size);
+			}
 			NS::SharedPtr<MTL::Heap> heap = NS::TransferPtr(device->newHeap(heap_desc.get()));
-			internal_state->buffer = NS::TransferPtr(heap->newBuffer(desc->size, resource_options, 0));
-			internal_state->buffer->makeAliasable();
+			internal_state->heap = heap;
+			if (heap.get() != nullptr)
+			{
+				internal_state->buffer = NS::TransferPtr(heap->newBuffer(desc->size, resource_options, 0));
+				// In Metal 4, MTLResidencySet must track the MTL::Heap itself, not individual heap-placed buffers.
+				allocationhandler->make_resident(heap.get());
+			}
 		}
 		else if (alias != nullptr)
 		{
-			// This is an aliasing view:
+			// This is an aliasing view (residency is inherited from the parent MTL::Heap):
 			if (alias->IsBuffer())
 			{
 				auto alias_internal = to_internal<GPUBuffer>(alias);
@@ -2146,14 +2174,19 @@ kernel void clear_3d_u(texture3d<uint, access::write> t [[texture(0)]], constant
 		{
 			// This is a placement sparse buffer:
 			internal_state->buffer = NS::TransferPtr(device->newBuffer(desc->size, resource_options, sparse_page_size));
+			allocationhandler->make_resident(internal_state->buffer.get());
+			internal_state->resident_in_set = true;
 		}
 		else
 		{
 			// This is a standalone buffer:
 			internal_state->buffer = NS::TransferPtr(device->newBuffer(desc->size, resource_options));
+			allocationhandler->make_resident(internal_state->buffer.get());
+			internal_state->resident_in_set = true;
 		}
 		
-		allocationhandler->make_resident(internal_state->buffer.get());
+		if (internal_state->buffer.get() == nullptr)
+			return false;
 		internal_state->gpu_address = internal_state->buffer->gpuAddress();
 		if ((resource_options & MTL::ResourceStorageModePrivate) == 0)
 		{
@@ -4683,8 +4716,9 @@ kernel void clear_3d_u(texture3d<uint, access::write> t [[texture(0)]], constant
 			return;
 		auto internal_state = to_internal(indexBuffer);
 		CommandList_Metal& commandlist = GetCommandList(cmd);
+		const uint64_t buf_len = internal_state->buffer->length();
 		commandlist.index_buffer.bufferAddress = internal_state->gpu_address + offset;
-		commandlist.index_buffer.length = internal_state->buffer->length();
+		commandlist.index_buffer.length = (offset < buf_len) ? (buf_len - offset) : 0;
 		commandlist.index_type = format == IndexBufferFormat::UINT32 ? MTL::IndexTypeUInt32 : MTL::IndexTypeUInt16;
 	}
 	void GraphicsDevice_Metal::BindStencilRef(uint32_t value, CommandList cmd)
@@ -4881,7 +4915,14 @@ kernel void clear_3d_u(texture3d<uint, access::write> t [[texture(0)]], constant
 		}
 		
 		predraw(cmd);
-		commandlist.render_encoder->drawIndexedPrimitives(commandlist.primitive_type, indexCount, commandlist.index_type, commandlist.index_buffer.bufferAddress + indexBufferOffset, commandlist.index_buffer.length);
+		if (indexCount == 0)
+			return;
+		const uint64_t remaining_len = (indexBufferOffset < commandlist.index_buffer.length)
+			? (commandlist.index_buffer.length - indexBufferOffset) : 0;
+		const uint64_t draw_ib_len = std::min(remaining_len, uint64_t(indexCount) * index_stride);
+		if (draw_ib_len < uint64_t(indexCount) * index_stride)
+			return;
+		commandlist.render_encoder->drawIndexedPrimitives(commandlist.primitive_type, indexCount, commandlist.index_type, commandlist.index_buffer.bufferAddress + indexBufferOffset, draw_ib_len);
 	}
 	void GraphicsDevice_Metal::DrawInstanced(uint32_t vertexCount, uint32_t instanceCount, uint32_t startVertexLocation, uint32_t startInstanceLocation, CommandList cmd)
 	{
@@ -5018,7 +5059,14 @@ kernel void clear_3d_u(texture3d<uint, access::write> t [[texture(0)]], constant
 		}
 		
 		predraw(cmd);
-		commandlist.render_encoder->drawIndexedPrimitives(commandlist.primitive_type, indexCount, commandlist.index_type, commandlist.index_buffer.bufferAddress + indexBufferOffset, commandlist.index_buffer.length, instanceCount, baseVertexLocation, startInstanceLocation);
+		if (indexCount == 0 || instanceCount == 0)
+			return;
+		const uint64_t remaining_len = (indexBufferOffset < commandlist.index_buffer.length)
+			? (commandlist.index_buffer.length - indexBufferOffset) : 0;
+		const uint64_t draw_ib_len = std::min(remaining_len, uint64_t(indexCount) * index_stride);
+		if (draw_ib_len < uint64_t(indexCount) * index_stride)
+			return;
+		commandlist.render_encoder->drawIndexedPrimitives(commandlist.primitive_type, indexCount, commandlist.index_type, commandlist.index_buffer.bufferAddress + indexBufferOffset, draw_ib_len, instanceCount, baseVertexLocation, startInstanceLocation);
 	}
 	void GraphicsDevice_Metal::DrawInstancedIndirect(const GPUBuffer* args, uint64_t args_offset, CommandList cmd)
 	{

@@ -218,7 +218,7 @@ struct alignas(16) RenderBatch
 	{
 		this->meshIndex = meshIndex;
 		this->instanceIndex = instanceIndex;
-		this->distance = XMConvertFloatToHalf(distance);
+		this->distance = XMConvertFloatToHalf(std::clamp(distance, 0.0f, 65504.0f));
 		this->sort_bits = sort_bits;
 		this->camera_mask = camera_mask;
 		this->lod_override = lod_override;
@@ -2837,6 +2837,7 @@ BufferSuballocation SuballocateGPUBuffer(uint64_t size)
 	assert(success);
 	device->SetName(&block.buffer, "GPUSubAllocator");
 	block.allocator.init(desc.size, (uint32_t)desc.alignment, true);
+	block.allocator.update_deferred_release(device->GetFrameCount(), device->GetBufferCount());
 	wilog("SuballocateGPUBuffer created buffer block with size: %s, with page size: %s, page count: %d", wi::helper::GetMemorySizeText(block.allocator.total_size_in_bytes()).c_str(), wi::helper::GetMemorySizeText(block.allocator.page_size).c_str(), (int)block.allocator.page_count);
 
 	allocation.allocation = block.allocator.allocate(size);
@@ -3440,7 +3441,10 @@ void RenderMeshes(
 			instancedBatch.lod = lod;
 		}
 
-		const float dither = std::max(instance.GetTransparency(), std::max(0.0f, batch.GetDistance() - instance.fadeDistance) / instance.radius);
+		const float fade_dither = (instance.fadeDistance < 1.0e30f && instance.radius > 0.0f)
+			? std::max(0.0f, batch.GetDistance() - instance.fadeDistance) / instance.radius
+			: 0.0f;
+		const float dither = std::max(instance.GetTransparency(), fade_dither);
 		if (dither > 0.99f)
 		{
 			continue;
