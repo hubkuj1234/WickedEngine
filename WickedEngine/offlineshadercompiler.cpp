@@ -38,6 +38,10 @@ struct ShaderEntry
 };
 wi::vector<ShaderEntry> shaders = {
 	{"hairparticle_simulateCS", wi::graphics::ShaderStage::CS},
+	{"hairstrand_sdf_initCS", wi::graphics::ShaderStage::CS},
+	{"hairstrand_sdf_jfaCS", wi::graphics::ShaderStage::CS},
+	{"hairstrand_simulateCS", wi::graphics::ShaderStage::CS},
+	{"hairstrand_followCS", wi::graphics::ShaderStage::CS},
 	{"emittedparticle_simulateCS", wi::graphics::ShaderStage::CS},
 	{"generateMIPChainCubeCS_float4", wi::graphics::ShaderStage::CS},
 	{"generateMIPChainCubeArrayCS_float4", wi::graphics::ShaderStage::CS},
@@ -242,6 +246,9 @@ wi::vector<ShaderEntry> shaders = {
 	{"hairparticlePS_prepass", wi::graphics::ShaderStage::PS },
 	{"hairparticlePS_prepass_depthonly", wi::graphics::ShaderStage::PS },
 	{"hairparticlePS_shadow", wi::graphics::ShaderStage::PS },
+	{"hairstrandPS", wi::graphics::ShaderStage::PS },
+	{"hairstrandPS_prepass", wi::graphics::ShaderStage::PS },
+	{"hairstrandPS_shadow", wi::graphics::ShaderStage::PS },
 	{"volumetricLight_SpotPS", wi::graphics::ShaderStage::PS },
 	{"volumetricLight_PointPS", wi::graphics::ShaderStage::PS },
 	{"volumetricLight_DirectionalPS", wi::graphics::ShaderStage::PS },
@@ -291,6 +298,7 @@ wi::vector<ShaderEntry> shaders = {
 
 
 	{"hairparticleVS", wi::graphics::ShaderStage::VS },
+	{"hairstrandVS", wi::graphics::ShaderStage::VS },
 	{"emittedparticleVS", wi::graphics::ShaderStage::VS },
 	{"emittedparticleVS_shadow", wi::graphics::ShaderStage::VS },
 	{"imageVS", wi::graphics::ShaderStage::VS },

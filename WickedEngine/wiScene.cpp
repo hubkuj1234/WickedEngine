@@ -110,7 +110,7 @@ namespace wi::scene
 
 		StartBuildTopDownHierarchy();
 
-		instanceArraySize = objects.GetCount() + hairs.GetCount() + emitters.GetCount();
+		instanceArraySize = objects.GetCount() + hairs.GetCount() + emitters.GetCount() + hair_strands.GetCount();
 		if (impostors.GetCount() > 0)
 		{
 			impostorInstanceOffset = uint32_t(instanceArraySize);
@@ -336,6 +336,7 @@ namespace wi::scene
 		geometryArraySize = geometryAllocator.load();
 		geometryArraySize += hairs.GetCount();
 		geometryArraySize += emitters.GetCount();
+		geometryArraySize += hair_strands.GetCount();
 		if (impostors.GetCount() > 0)
 		{
 			impostorGeometryOffset = uint32_t(geometryArraySize);
@@ -5394,6 +5395,83 @@ namespace wi::scene
 				device->WriteTopLevelAccelerationStructureInstance(&instance, dest);
 			}
 
+		});
+
+		wi::jobsystem::Dispatch(ctx, (uint32_t)hair_strands.GetCount(), small_subtask_groupsize, [&](wi::jobsystem::JobArgs args) {
+			HairStrandSystem& hair = hair_strands[args.jobIndex];
+			Entity entity = hair_strands.GetEntity(args.jobIndex);
+			const TransformComponent* transform = transforms.GetComponent(entity);
+			TransformComponent fallbackTransform;
+			hair.UpdateCPU(transform ? *transform : fallbackTransform, dt);
+
+			const LayerComponent* layer = layers.GetComponent(entity);
+			if (layer != nullptr)
+			{
+				hair.layerMask = layer->GetLayerMask();
+			}
+
+			GraphicsDevice* device = wi::graphics::GetDevice();
+
+			ShaderGeometry geometry = shader_geometry_null;
+			geometry.indexOffset = 0;
+			geometry.indexCount = hair.GetTotalRenderSegments();
+			geometry.materialIndex = 0;
+			geometry.ib = device->GetDescriptorIndex(&hair.segmentIndexBuffer, SubresourceType::SRV);
+			geometry.vb_pos_wind = device->GetDescriptorIndex(&hair.renderPositionBuffer, SubresourceType::SRV);
+			geometry.vb_pre = device->GetDescriptorIndex(&hair.renderPrevPositionBuffer, SubresourceType::SRV);
+			geometry.vb_nor = device->GetDescriptorIndex(&hair.renderTangentBuffer, SubresourceType::SRV);
+			geometry.vb_uvs = device->GetDescriptorIndex(&hair.materialBuffer, SubresourceType::SRV);
+			geometry.flags = SHADERMESH_FLAG_DOUBLE_SIDED | SHADERMESH_FLAG_HAIRSTRAND;
+			geometry.aabb_min = hair.aabb._min;
+			geometry.aabb_max = hair.aabb._max;
+
+			size_t geometryAllocation = geometryAllocator.fetch_add(1);
+			std::memcpy(geometryArrayMapped + geometryAllocation, &geometry, sizeof(geometry));
+
+			ShaderMeshInstance inst = shader_mesh_instance_null;
+			inst.uid = entity;
+			inst.layerMask = hair.layerMask;
+			inst.emissive = wi::math::pack_half3(XMFLOAT3(1, 1, 1));
+			inst.color = wi::math::pack_half4(XMFLOAT4(1, 1, 1, 1));
+			inst.center = hair.aabb.getCenter();
+			inst.radius = hair.aabb.getRadius();
+			inst.geometryOffset = (uint)geometryAllocation;
+			inst.geometryCount = 1;
+			inst.baseGeometryOffset = inst.geometryOffset;
+			inst.baseGeometryCount = inst.geometryCount;
+			inst.fadeDistance = FLT_MAX;
+			inst.transform.Create(wi::math::IDENTITY_MATRIX);
+			inst.transformPrev = inst.transform;
+
+			const size_t instanceIndex = objects.GetCount() + hairs.GetCount() + emitters.GetCount() + args.jobIndex;
+			std::memcpy(instanceArrayMapped + instanceIndex, &inst, sizeof(inst));
+
+			if (TLAS_instancesMapped != nullptr && hair.enabled && hair.GetTotalRenderSegments() > 0)
+			{
+				if (!hair.BLAS.IsValid())
+				{
+					hair.CreateRaytracingRenderData();
+				}
+				if (hair.BLAS.IsValid())
+				{
+					RaytracingAccelerationStructureDesc::TopLevel::Instance instance;
+					for (int i = 0; i < arraysize(instance.transform); ++i)
+					{
+						for (int j = 0; j < arraysize(instance.transform[i]); ++j)
+						{
+							instance.transform[i][j] = wi::math::IDENTITY_MATRIX.m[j][i];
+						}
+					}
+					instance.instance_id = (uint32_t)instanceIndex;
+					instance.instance_mask = hair.layerMask == 0 ? 0 : 0xFF;
+					instance.bottom_level = &hair.BLAS;
+					instance.instance_contribution_to_hit_group_index = 0;
+					instance.flags = RaytracingAccelerationStructureDesc::TopLevel::Instance::FLAG_FORCE_NON_OPAQUE;
+
+					void* dest = (void*)((size_t)TLAS_instancesMapped + instanceIndex * device->GetTopLevelAccelerationStructureInstanceSize());
+					device->WriteTopLevelAccelerationStructureInstance(&instance, dest);
+				}
+			}
 		});
 
 		if (gaussian_splats.GetCount() > 0)

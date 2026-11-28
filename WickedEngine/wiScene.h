@@ -10,6 +10,7 @@
 #include "wiScene_Components.h"
 #include "wiEmittedParticle.h"
 #include "wiHairParticle.h"
+#include "wiHairStrand.h"
 #include "wiTerrain.h"
 #include "wiBVH.h"
 #include "wiUnorderedSet.h"
@@ -48,6 +49,7 @@ namespace wi::scene
 		wi::ecs::ComponentManager<AnimationDataComponent>& animation_datas = componentLibrary.Register<AnimationDataComponent>("wi::scene::Scene::animation_datas");
 		wi::ecs::ComponentManager<EmittedParticleSystem>& emitters = componentLibrary.Register<EmittedParticleSystem>("wi::scene::Scene::emitters", 3); // version = 3
 		wi::ecs::ComponentManager<HairParticleSystem>& hairs = componentLibrary.Register<HairParticleSystem>("wi::scene::Scene::hairs", 3); // version = 3
+		wi::ecs::ComponentManager<HairStrandSystem>& hair_strands = componentLibrary.Register<HairStrandSystem>("wi::scene::Scene::hair_strands", 1); // version = 1
 		wi::ecs::ComponentManager<WeatherComponent>& weathers = componentLibrary.Register<WeatherComponent>("wi::scene::Scene::weathers", 6); // version = 6
 		wi::ecs::ComponentManager<SoundComponent>& sounds = componentLibrary.Register<SoundComponent>("wi::scene::Scene::sounds", 1); // version = 1
 		wi::ecs::ComponentManager<VideoComponent>& videos = componentLibrary.Register<VideoComponent>("wi::scene::Scene::videos", 2); // version = 2

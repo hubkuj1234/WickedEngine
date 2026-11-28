@@ -1,5 +1,6 @@
 #include "wiRenderer.h"
 #include "wiHairParticle.h"
+#include "wiHairStrand.h"
 #include "wiEmittedParticle.h"
 #include "wiSprite.h"
 #include "wiScene.h"
@@ -5396,6 +5397,26 @@ void UpdateRenderData(
 		wi::profiler::EndRange(range);
 	}
 
+	if (vis.scene->hair_strands.GetCount() > 0)
+	{
+		static thread_local wi::vector<HairStrandSystem::UpdateGPUItem> strand_updates;
+		auto range = wi::profiler::BeginRangeGPU("HairStrands - TressFX Simulate", cmd);
+		const uint32_t baseInst = (uint32_t)(vis.scene->objects.GetCount() + vis.scene->hairs.GetCount() + vis.scene->emitters.GetCount());
+		for (size_t i = 0; i < vis.scene->hair_strands.GetCount(); ++i)
+		{
+			const wi::HairStrandSystem& hs = vis.scene->hair_strands[i];
+			if (hs.enabled && hs.guideCount > 0)
+			{
+				auto& item = strand_updates.emplace_back();
+				item.hair = &hs;
+				item.instanceIndex = baseInst + (uint32_t)i;
+			}
+		}
+		HairStrandSystem::UpdateGPU(strand_updates.data(), (uint32_t)strand_updates.size(), cmd);
+		strand_updates.clear();
+		wi::profiler::EndRange(range);
+	}
+
 	// Impostor prepare:
 	if (vis.scene->impostors.GetCount() > 0 && vis.scene->objects.GetCount() > 0 && vis.scene->impostorBuffer.IsValid())
 	{
@@ -5802,6 +5823,17 @@ void UpdateRaytracingAccelerationStructures(const Scene& scene, CommandList cmd)
 						device->BuildRaytracingAccelerationStructure(&hair.BLAS, cmd, rebuild ? nullptr : &hair.BLAS);
 						hair.must_rebuild_blas = false;
 					}
+				}
+			}
+
+			for (size_t i = 0; i < scene.hair_strands.GetCount(); ++i)
+			{
+				const wi::HairStrandSystem& hs = scene.hair_strands[i];
+				if (hs.enabled && hs.BLAS.IsValid())
+				{
+					const bool rebuild = hs.mustRebuildBLAS;
+					device->BuildRaytracingAccelerationStructure(&hs.BLAS, cmd, rebuild ? nullptr : &hs.BLAS);
+					hs.mustRebuildBLAS = false;
 				}
 			}
 
@@ -6896,6 +6928,24 @@ void DrawShadowmaps(
 			}
 		}
 
+		for (size_t i = 0; i < vis.scene->hair_strands.GetCount(); ++i)
+		{
+			const HairStrandSystem& hs = vis.scene->hair_strands[i];
+			if (!hs.enabled || hs.guideCount == 0)
+				continue;
+			uint16_t camera_mask = 0;
+			for (uint32_t view = 0; view < view_count; ++view)
+			{
+				if (!shcams[view].frustum.CheckBoxFast(hs.aabb))
+					continue;
+				camera_mask |= 1u << view;
+			}
+			if (camera_mask != 0)
+			{
+				hs.Draw(RENDERPASS_SHADOW, cmd, camera_mask);
+			}
+		}
+
 		if (!vis.visibleEmitters.empty())
 		{
 			for (uint32_t emitterIndex : vis.visibleEmitters)
@@ -7319,6 +7369,18 @@ void DrawScene(
 				const MaterialComponent& material = *vis.scene->materials.GetComponent(entity);
 
 				hair.Draw(material, renderPass, cmd);
+			}
+		}
+	}
+
+	if (renderPass == RENDERPASS_MAIN && (IsWireRender() || !transparent))
+	{
+		for (size_t i = 0; i < vis.scene->hair_strands.GetCount(); ++i)
+		{
+			const wi::HairStrandSystem& hs = vis.scene->hair_strands[i];
+			if (hs.enabled && hs.guideCount > 0)
+			{
+				hs.Draw(renderPass, cmd);
 			}
 		}
 	}
